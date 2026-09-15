@@ -89,6 +89,30 @@ def _load_version(conn, process_code: str, version: int | None):
     return record
 
 
+def _lock_violation(rule, locks: set[str]) -> dict | None:
+    """候选规则触碰导师锁定步骤时返回违规说明；否则 None。
+
+    锁定步骤：不允许改角色/入口/终态属性；不允许新增 normal/default 边改变主线，
+    但允许补充异常出口（timeout/missing/mismatch/escalate 等）。
+    """
+    if rule.source not in locks:
+        return None
+    if rule.kind in ("set_role", "mark_entry", "fix_terminal"):
+        return {
+            "message": f"步骤 {rule.source} 已被导师锁定，候选 {rule.code} 不得改动其责任/入口/终态属性",
+            "candidate": rule.code, "locked_step": rule.source,
+        }
+    if rule.kind == "add_branch" and rule.trigger in ("normal", "default"):
+        return {
+            "message": (
+                f"步骤 {rule.source} 已被导师锁定正常主线，候选 {rule.code} 不得新增 "
+                f"{rule.trigger} 分支（仅允许补充异常出口）"
+            ),
+            "candidate": rule.code, "locked_step": rule.source,
+        }
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 健康检查 / 概览
 # ---------------------------------------------------------------------------
@@ -173,18 +197,22 @@ def get_one_version(code: str, version: int, conn=Depends(conn_dep)):
 
 
 def _graph_overview(spec: ProcessSpec) -> dict:
-    graph = build_graph(spec)
+    from app.graph import materialize_edges
+
+    build_graph(spec)
     return {
         "nodes": [
             {"code": s.code, "name": s.name, "role": s.role, "entry": s.entry,
              "terminal": s.terminal, "time_limit_minutes": s.time_limit_minutes,
+             "on_timeout": s.on_timeout,
              "inputs": s.inputs, "outputs": s.outputs}
             for s in spec.steps
         ],
         "edges": [
             {"source": b.source, "target": b.target, "trigger": b.trigger,
-             "has_condition": b.condition is not None, "label": b.label}
-            for b in spec.branches
+             "has_condition": b.condition is not None, "label": b.label,
+             "implicit": b.implicit}
+            for b in materialize_edges(spec)
         ],
         "entry_nodes": [s.code for s in spec.steps if s.entry],
         "terminal_nodes": [s.code for s in spec.steps if s.terminal],
@@ -464,21 +492,12 @@ def submit_candidate(code: str, version: int, rule: CandidateRule,
     spec = record["spec"]
     locks = db.get_locks(conn, code, version)
 
-    # 校验候选本身可应用；触及导师锁定步骤的结构性改动一律拒绝
+    # 校验候选本身可应用；触及导师锁定步骤的改动按统一规则拒绝
     if rule.source not in spec.step_map():
         raise HTTPException(422, f"候选源步骤 {rule.source} 不存在")
-    if rule.kind in ("set_role", "mark_entry", "fix_terminal") and rule.source in locks:
-        raise HTTPException(409, detail={
-            "message": f"步骤 {rule.source} 已被导师锁定，候选规则不得改动其责任/入口/终态属性",
-            "locked_step": rule.source,
-        })
-    if rule.kind == "add_branch" and rule.source in locks:
-        # 锁定步骤允许补充异常出口，但不得改变其正常主线
-        if rule.trigger == "normal":
-            raise HTTPException(409, detail={
-                "message": f"步骤 {rule.source} 已锁定正常分支，不能新增正常边（可补异常出口）",
-                "locked_step": rule.source,
-            })
+    violation = _lock_violation(rule, locks)
+    if violation is not None:
+        raise HTTPException(409, detail=violation)
     try:
         apply_candidates(spec, [rule])
     except ValueError as exc:
@@ -513,11 +532,9 @@ def repair_minimal(body: RepairRequest, conn=Depends(conn_dep)):
     if not body.allow_locked:
         locks = db.get_locks(conn, body.process_code, record["version"])
         for rule in rules:
-            if rule.kind in ("set_role", "mark_entry", "fix_terminal") and rule.source in locks:
-                raise HTTPException(409, detail={
-                    "message": f"候选 {rule.code} 试图改动导师锁定步骤 {rule.source}",
-                    "candidate": rule.code, "locked_step": rule.source,
-                })
+            violation = _lock_violation(rule, locks)
+            if violation is not None:
+                raise HTTPException(409, detail=violation)
 
     result = find_minimal(spec, rules, scenarios)
     db.save_repair_run(

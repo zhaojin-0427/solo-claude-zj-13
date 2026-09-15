@@ -105,6 +105,9 @@ class Branch(BaseModel):
     terminal_outcome: str | None = Field(
         None, description="就地终结时的结局说明（target 为空时使用）"
     )
+    implicit: bool = Field(
+        False, description="是否由步骤 on_timeout 物化出的隐式边（校验/引擎内部使用）"
+    )
 
 
 class ProcessSpec(BaseModel):

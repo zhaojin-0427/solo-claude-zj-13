@@ -46,7 +46,12 @@ mismatch（结果不符） > normal（正常） > default（兜底）**；同触
 | `cycle` | 循环依赖：Tarjan 强连通分量中**没有任何边能离开**的环（可退出的返工环不算） |
 | `no_role` | 无人承接（责任角色为空）的步骤 |
 | `no_exit` | 分支无出口：反向传播后仍到不了 terminal 节点或就地终结边的节点 |
-| `dangling_ref` / `duplicate_step` | 分支引用不存在的步骤 / 步骤编码重复（附加校验） |
+| `dangling_ref` / `duplicate_step` | 分支或步骤 `on_timeout` 指向不存在的步骤（节点给出**发起引用的源步骤**）/ 步骤编码重复 |
+
+`on_timeout` 会被物化为一条隐式 `timeout` 边参与全部分析（同节点已有显式 timeout
+分支时以显式为准）；指向未定义步骤时 `dangling_ref.nodes` 返回声明它的步骤，
+`POST /processes` 一律 422 拒绝、不产生版本，因此超时不可能在运行时跳进幽灵节点
+（引擎侧对残留悬空也有"无出口停滞"兜底，不会再对下一轮返回 409）。
 
 校验不过的流程 **422 拒绝，不写任何版本**，响应体给出每个问题的节点编码与说明。
 
@@ -62,18 +67,26 @@ mismatch（结果不符） > normal（正常） > default（兜底）**；同触
 1. `POST /sessions`：绑定情境，或只指定 `entry`（自由演练限入口节点）从任一入口开始。
 2. `GET /sessions/{id}/prompt`：**只返回当下可执行动作**——责任角色、应产出、时限、
    前置材料到位情况、本节点的处置方向与依据；不透露后续步骤内部信息。
-3. `POST /sessions/{id}/rounds`：提交本轮产出、耗时、实际承接角色：
+3. `POST /sessions/{id}/rounds`：提交本轮产出、耗时、实际承接角色。检查顺序：
    * 角色不符 → 直接拦截（`blocked`，状态不推进，事件仍留痕）；
-   * 前置材料缺失 → 本轮产出不入账，走 `missing_any` 异常边（如退回补齐）；
-   * 累计耗时超时限 → 走 `timeout` 边；`result_checks` 不通过 → 走 `mismatch` 边；
-   * 异常节点没有对应出口 → 标记"无出口停滞"（不算明确结局，供修复使用）；
+   * 前置材料缺失 → 不计时、本轮产出不入账，走 `missing_any` 异常边（如退回补齐）；
+   * 累计耗时超时限 → 走 `timeout` 边（含步骤 `on_timeout` 隐式边，超时优先于产出检查）；
+   * **必需产出缺失**（步骤 `outputs` 中声明但本轮未提交）→ 拦截
+     `missing_required_output`，不注册产出、不计时、**不得进入 normal 分支**；
+   * `result_checks` 不通过 → 走 `mismatch` 边；
+   * 正常完成时，只有 `terminal` 步骤或显式就地终结边才算结局；**非终态步骤若没有
+     normal/default 出口，返回 `no_exit=true`、`completed=false` 并停留在本节点**，
+     不会被错误标记为完成（下一轮仍可继续，不会 409）；
    * `force_default=true` 可强行按默认方向继续，但记录 `force_through` /
      `missed_escalation` 违规，供复盘定位"漏升级"。
 4. `POST /sessions/{id}/jump`：学生试图跳步只记录不执行，复盘列为 `jump_attempt`。
 5. `GET /sessions/{id}/path`：实际路径（每轮的步骤/触发器/是否强推）与结局。
 
 **材料是版本化实例**：同名材料再次产出会让旧实例失效（`active=false`），取值永远取
-最新有效实例；每次失效都会在动作事件里留下 `stale` 记录，复盘据此定位"沿用旧产出"。
+最新有效实例；每次失效都会在动作事件里留下 `stale` 记录。但"版本更替"不等于问题：
+引擎在每个被接受的动作注册产出前，会快照该步骤本轮**实际消费**了哪些前置材料及所属
+实例；复盘只在"下游步骤消费了某实例 → 该实例后来被新产出取代 → 而消费步骤没有基于
+新版本重跑愈合"时才报 `stale_output`（旧产出从未被消费不算，例如设备调拨后重新发放）。
 
 引擎是无时钟、无随机的纯函数；会话状态可随时丢弃内存缓存、仅靠 SQLite 事件流
 （`replay`）逐轮重建，结果一致。`POST /determinism/check` 对同版本同情境重复仿真多次
@@ -93,8 +106,10 @@ mismatch（结果不符） > normal（正常） > default（兜底）**；同触
 ## 导师锁定与最少补充项（`app/repair.py`）
 
 * `POST /locks/{proc}/versions/{v}/steps/{step}`：导师锁定确认过的步骤；重复锁定
-  409 且不覆盖原导师痕迹。对锁定步骤提交 `set_role`/`mark_entry`/`fix_terminal`
-  候选会 409；`add_branch` 只允许补异常出口、不允许改正常主线。
+  409 且不覆盖原导师痕迹。锁定保护在**所有入口一致生效**：`/candidates` 提交与
+  `/repair/minimal` 搜索（`allow_locked=false`，默认）都拒绝在锁定步骤上
+  `set_role`/`mark_entry`/`fix_terminal`，也拒绝新增 `normal`/`default` 边改变其
+  正常主线；只允许补 `timeout`/`missing_any`/`mismatch` 等异常出口。
 * `POST /candidates/...`：提交候选规则（加边/定角色/设入口/补终态）。
 * `POST /repair/minimal`：对每条候选做副本补丁（原版本不动），按组合大小、再按
   候选编码字典序枚举（结果确定），找出使**所有指定情境都抵达明确结局且满足各自

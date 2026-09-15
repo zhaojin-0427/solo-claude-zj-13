@@ -128,7 +128,13 @@ def test_force_default_marks_missed_escalation(client):
     assert any(f["type"] == "missed_escalation" for f in review["findings"])
 
 
-def test_s3_timeout_and_stale_output(client):
+def test_s3_timeout_and_benign_reissue(client):
+    """设备发放超时走异常分支；调拨后重新发放。
+
+    旧的 equipment_received 从未被下游消费（超时轮直接转 admin_followup），
+    因此重新产出同名材料虽会产生版本更替（stale_materials 留痕），但复盘不应
+    判定为 stale_output（没有沿用旧产出）。
+    """
     sid = _start(client, scenario="S3_equipment_timeout")
     path_bodies = [
         {"round_no": 1, "produce": {"id_verified": "x"}, "role": "前台"},
@@ -138,14 +144,14 @@ def test_s3_timeout_and_stale_output(client):
     ]
     for body in path_bodies:
         client.post(f"/sessions/{sid}/rounds", json=body)
-    # 设备发放超时 -> admin_followup
+    # 设备发放超时 -> admin_followup（本轮产出仍注册，异常分支照常）
     r = client.post(f"/sessions/{sid}/rounds", json={
         "round_no": 5, "produce": {"equipment_received": "未发放"},
         "elapsed_minutes": 500, "role": "行政"})
     result = r.json()["result"]
     assert result["fired"] == "timeout"
     assert result["next_step"] == "admin_followup"
-    # 调拨后重走发放：同名材料再次产出，旧实例 stale
+    # 调拨后重走发放：同名材料再次产出，事件中记录版本更替
     client.post(f"/sessions/{sid}/rounds", json={
         "round_no": 6, "produce": {"equipment_rescheduled": "调拨#B7"}, "role": "行政主管"})
     r = client.post(f"/sessions/{sid}/rounds", json={
@@ -156,9 +162,51 @@ def test_s3_timeout_and_stale_output(client):
     client.post(f"/sessions/{sid}/rounds", json={
         "round_no": 8, "produce": {"onboarding_done": True}, "role": "导师"})
     review = client.get(f"/sessions/{sid}/review").json()["review"]
-    assert any(f["type"] == "stale_output" for f in review["findings"])
+    # 没有任何步骤消费过旧的 equipment_received，不算沿用旧产出
+    assert not any(f["type"] == "stale_output" for f in review["findings"])
+    # 但材料版本更替仍在留痕信息中可见
+    keys = {m["key"] for m in review["stale_materials"]}
+    assert "equipment_received" in keys
     assert review["outcome_match"] == "match"
     assert review["scenario_stopped_reason"] is None
+
+
+def test_stale_output_engine_semantics(client):
+    """引擎级：只有旧实例被下游消费后又被取代、且未重跑愈合，才算 stale_output。"""
+    from app.engine import execute_round, init_state
+    from app.graph import build_graph
+    from app.review import _stale_consumptions
+    from app.schemas import Branch, ProcessSpec, ResultCheck, Step
+
+    spec = ProcessSpec(code="stale_demo", name="旧产出演示", version=1, steps=[
+        Step(code="a", name="制单", role="r", entry=True, outputs=["doc"],
+             time_limit_minutes=100),
+        Step(code="b", name="审核", role="r", inputs=["doc"], outputs=["checked"]),
+        Step(code="c", name="归档", role="r", inputs=["doc", "checked"],
+             outputs=["archived"], terminal=True,
+             result_checks=[ResultCheck(key="archived", op="eq", value=True)]),
+    ], branches=[
+        Branch(source="a", target="b", trigger="normal"),
+        Branch(source="b", target="c", trigger="normal"),
+        Branch(source="c", target="a", trigger="mismatch", label="归档发现问题返工"),
+        Branch(source="c", target=None, trigger="normal", terminal_outcome="done"),
+    ])
+    g = build_graph(spec)
+
+    # 情形一：c 消费 doc v1（经 b），随后 a 重发出 v2，c 没有重跑 -> stale
+    st = init_state(spec, g, entry="a")
+    execute_round(st, 1, produce={"doc": "v1"}, role="r")
+    execute_round(st, 2, produce={"checked": "ok-v1"}, role="r")
+    res3 = execute_round(st, 3, produce={"archived": False}, role="r")  # 触发返工
+    assert res3["next_step"] == "a"
+    execute_round(st, 4, produce={"doc": "v2"}, role="r")  # a 重发，v1 失效
+    stale = _stale_consumptions(st)
+    assert {(f["step"], f["material"]) for f in stale} == {("b", "doc"), ("c", "doc")}
+
+    # 情形二：b、c 基于 v2 重跑愈合 -> 无 stale
+    execute_round(st, 5, produce={"checked": "ok-v2"}, role="r")
+    execute_round(st, 6, produce={"archived": True}, role="r")
+    assert _stale_consumptions(st) == []
 
 
 def test_session_replay_restores_state_after_restore(client):
@@ -210,21 +258,35 @@ def test_s1_review_is_clean(client):
 
 
 def test_missing_material_backward_branch(client):
-    """缺材料时按 missing_any 回退边回到上游；补齐材料后才能继续。
-
-    用一个临时提交流程：file_info 需要 id_verified；当学生从入口进来但接待轮
-    未产出核验结果时，下一步动作依据会明确标出材料缺失。
-    """
+    """缺必需产出时拦截在原步骤；补齐后，若前置材料缺失则走 missing_any 回退边。"""
     sid = _start(client, scenario="S1_normal_onboarding")
-    # 接待轮不产出 id_verified：正常边仍可走，但 file_info 的依据会暴露缺失
-    client.post(f"/sessions/{sid}/rounds", json={
+    # 接待步骤声明必需产出 id_verified：空 produce 被拦截，不能进入 normal
+    r = client.post(f"/sessions/{sid}/rounds", json={
         "round_no": 1, "produce": {}, "role": "前台"})
+    result = r.json()["result"]
+    assert result["blocked"] is True
+    assert result["blocked_reason"] == "missing_required_output"
+    assert result["missing_outputs"] == ["id_verified"]
+    prompt = client.get(f"/sessions/{sid}/prompt").json()["prompt"]
+    assert prompt["current_step"] == "receive_new_hire"  # 状态未推进
+
+    # 补齐产出后前进到 file_info
+    client.post(f"/sessions/{sid}/rounds", json={
+        "round_no": 2, "produce": {"id_verified": "核验通过"}, "role": "前台"})
     prompt = client.get(f"/sessions/{sid}/prompt").json()["prompt"]
     assert prompt["current_step"] == "file_info"
-    assert prompt["inputs_status"][0]["available"] is False
-    # 在 file_info 提交动作：缺材料 -> missing_any -> 回到 receive_new_hire
-    r = client.post(f"/sessions/{sid}/rounds", json={
-        "round_no": 2, "produce": {"employee_profile": "无核验建档"}, "role": "人事专员"})
+
+    # 另造一个缺前置材料的会话：通过自由入口无法直达 file_info，
+    # 用自定义情境：从 file_info 入口且无初始材料
+    r = client.post("/scenarios", json={
+        "code": "TMP_missing_input", "name": "缺前置材料",
+        "process_code": PROCESS,
+        "entry": "file_info", "params": {"doc_complete": True},
+        "rounds": []})
+    assert r.status_code == 200, r.text
+    sid2 = _start(client, scenario="TMP_missing_input")
+    r = client.post(f"/sessions/{sid2}/rounds", json={
+        "round_no": 1, "produce": {"employee_profile": "无核验建档"}, "role": "人事专员"})
     result = r.json()["result"]
     assert result["fired"] == "missing_any"
     assert result["missing"] == ["id_verified"]

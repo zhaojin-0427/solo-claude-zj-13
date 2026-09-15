@@ -1,15 +1,70 @@
-"""复盘：对照预期路径，定位跳步、沿用旧产出、漏掉升级条件。"""
+"""复盘：对照预期路径，定位跳步、沿用旧产出、漏掉升级条件。
+
+旧产出（stale_output）的语义：
+  引擎在每个被接受的动作注册产出前，快照该步骤本轮实际消费了哪些前置材料
+  及其当时所属实例（state.consumptions）。只有当
+    1) 该实例后来被同键的新产出取代（inactive），且
+    2) 消费它的步骤在此之后没有再消费该键的更新实例（没有重跑“愈合”），
+  才判定为“沿用旧产出”。单纯重新产出一份材料但无人消费旧版本，不构成问题
+  （例如设备调拨后重新发放，旧发放记录从未被下游使用）。
+"""
 from __future__ import annotations
 
 from typing import Any
 
-from app.engine import EngineState, latest_active, replay, simulate
+from app.engine import latest_active, replay, simulate
 from app.graph import Graph
 from app.schemas import ProcessSpec, Scenario
 
 
 def _event_path(events: list[dict[str, Any]]) -> list[str]:
-    return [e["at_step"] for e in events if e["kind"] == "action" and not e["payload"].get("blocked")]
+    return [e["at_step"] for e in events
+            if e["kind"] == "action" and not e["payload"].get("blocked")]
+
+
+def _stale_consumptions(actual_state) -> list[dict[str, Any]]:
+    """依据消费快照与材料实例版本，找出真正沿用了旧产出的消费点。"""
+    # 每个材料键的全部实例（按产出轮次有序）；active 为最新有效版本
+    instances_by_key: dict[str, list] = {}
+    for key, instances in actual_state.materials.items():
+        instances_by_key[key] = instances
+
+    # (step, material) 在所有消费中用到的最大产出轮次（重跑愈合依据）
+    latest_consumed_round: dict[tuple[str, str], int] = {}
+    for c in actual_state.consumptions:
+        k = (c["step"], c["material"])
+        latest_consumed_round[k] = max(
+            latest_consumed_round.get(k, -1), c["produced_round"]
+        )
+
+    stale: list[dict[str, Any]] = []
+    for c in actual_state.consumptions:
+        key = c["material"]
+        inst_round = c["produced_round"]
+        inst = next(
+            (i for i in instances_by_key.get(key, [])
+             if i.produced_round == inst_round and i.produced_at_step == c["produced_at_step"]),
+            None,
+        )
+        if inst is None or inst.active:
+            continue  # 消费的实例至今仍有效，不是旧产出
+        if latest_consumed_round[(c["step"], key)] > inst_round:
+            continue  # 该步骤后来重跑并消费了更新版本，旧消费已被愈合
+        current = latest_active(instances_by_key[key])
+        stale.append({
+            "type": "stale_output",
+            "severity": "high",
+            "step": c["step"],
+            "round_no": c["round_no"],
+            "material": key,
+            "detail": (
+                f"第 {c['round_no']} 轮在 {c['step']} 使用的 {key} 是第 "
+                f"{inst_round} 轮（{inst.produced_at_step}）的旧产出；该材料已被"
+                f"{('第 ' + str(current.produced_round) + ' 轮 ' + current.produced_at_step) if current else '新版本'}"
+                f"取代，而 {c['step']} 没有基于新版本重跑，属于沿用旧产出"
+            ),
+        })
+    return stale
 
 
 def review_session(
@@ -19,11 +74,9 @@ def review_session(
     scenario: Scenario | None = None,
 ) -> dict[str, Any]:
     """生成复盘报告。有情境时对照情境脚本得到预期路径。"""
-    # 实际路径
     actual_steps = _event_path(events)
     actual_state = replay(spec, graph, events)
 
-    # 预期路径
     expected_steps: list[str] = []
     expected_outcome_step: str | None = None
     sim_stopped: str | None = None
@@ -50,60 +103,26 @@ def review_session(
         findings.append({"type": "jump_attempt", "severity": "high", **j,
                          "detail": f"第 {j['round_no']} 轮试图从 {j['from_step']} 直接跳到 {j['to_step']}"})
 
-    # 隐式跳步：预期路径中被整段越过的步骤（异常重路由造成）
+    # 隐式跳步：预期路径中完全没有执行到的步骤（异常重路由整段越过）
     if expected_steps:
-        actual_set = set(actual_steps)
-        skipped = [
-            s for s in expected_steps
-            if s not in actual_set
-            and expected_steps.index(s) < len(expected_steps) - 1
-        ]
-        # 用序列对齐再确认：预期中某步前后相邻步骤在实际里相邻出现，即越过该步
-        for i in range(len(expected_steps) - 1):
-            a, b = expected_steps[i], expected_steps[i + 1]
-            if a in actual_steps and b in actual_steps:
-                ia, ib = actual_steps.index(a), actual_steps.index(b)
-                if ia < ib:
-                    for s in expected_steps[i + 1: i + 1 + (ib - ia)]:
-                        if s not in actual_steps[i + 1:ib + 1] and s in expected_steps and s not in skipped:
-                            pass
+        skipped = [s for s in expected_steps[:-1] if s not in set(actual_steps)]
         for s in skipped:
             findings.append({
                 "type": "skipped_step", "severity": "high", "step": s,
                 "detail": f"预期路径中的步骤 {s} 在实际路径中完全没有执行",
             })
-
-    # 多出的步骤（实际走了预期没有的节点，通常是误入异常分支）
-    if expected_steps:
-        extra = [s for s in actual_steps if s not in expected_steps]
+        extra = [s for s in actual_steps if s not in set(expected_steps)]
         for s in extra:
             findings.append({
                 "type": "extra_step", "severity": "medium", "step": s,
                 "detail": f"实际路径进入了预期之外的步骤 {s}（可能误入异常分支）",
             })
 
-    # 2) 沿用旧产出：动作事件中的 stale 记录
-    stale_usages: list[dict[str, Any]] = []
-    for e in events:
-        if e["kind"] == "action":
-            for stale in e["payload"].get("stale", []):
-                stale_usages.append({
-                    "round_no": e["payload"].get("round_no"),
-                    "at_step": e["at_step"],
-                    **stale,
-                })
-    for su in stale_usages:
-        findings.append({
-            "type": "stale_output", "severity": "medium",
-            "step": su["at_step"], "material": su["key"],
-            "detail": (
-                f"第 {su['round_no']} 轮在 {su['at_step']} 重新产出 {su['key']}，"
-                f"第 {su['superseded_round']} 轮在 {su['superseded_at_step']} 的旧产出已失效，"
-                f"之后不得再沿用"
-            ),
-        })
+    # 2) 沿用旧产出：只统计“旧实例被实际消费且未重跑愈合”的消费点
+    stale_findings = _stale_consumptions(actual_state)
+    findings.extend(stale_findings)
 
-    # 终态材料中是否存在被更新过、但路径上仍可能被旧环节引用的材料（提示性）
+    # 材料版本现状（提示性：哪些键发生过版本更替；不等于旧产出问题）
     stale_materials_now: list[dict[str, Any]] = []
     for key, instances in actual_state.materials.items():
         inactive = [i for i in instances if not i.active]
@@ -117,6 +136,9 @@ def review_session(
                     {"round": i.produced_round, "step": i.produced_at_step}
                     for i in inactive
                 ],
+                "consumed_by_steps": sorted({
+                    c["step"] for c in actual_state.consumptions if c["material"] == key
+                }),
             })
 
     # 3) 漏掉升级条件：force_through / missed_escalation 违规
@@ -144,9 +166,7 @@ def review_session(
     if scenario is not None:
         if scenario.expected_outcome is not None:
             actual_token = actual_state.outcome or actual_state.outcome_step
-            outcome_match = (
-                "match" if actual_token == scenario.expected_outcome else "mismatch"
-            )
+            outcome_match = "match" if actual_token == scenario.expected_outcome else "mismatch"
         elif expected_outcome_step is not None:
             outcome_match = (
                 "match" if actual_state.outcome_step == expected_outcome_step else "mismatch"

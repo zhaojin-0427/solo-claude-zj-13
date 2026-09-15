@@ -45,6 +45,8 @@ class EngineState:
     params: dict[str, Any]
     materials: dict[str, list[MaterialInstance]] = field(default_factory=dict)
     path: list[dict[str, Any]] = field(default_factory=list)  # 实际路径（仅被接受的动作）
+    # 每个步骤各轮实际消费的前置材料实例（产出注册前快照，供复盘判定旧产出）
+    consumptions: list[dict[str, Any]] = field(default_factory=list)
     current: str | None = None
     elapsed_at_step: dict[str, int] = field(default_factory=dict)
     completed: bool = False
@@ -127,22 +129,14 @@ def select_edge(
         edge = _matching_edge(edges, fired, context)
         if edge is not None:
             return edge, edge.target, f"命中分支触发器 {fired}"
-        # 超时可用步骤自身声明兜底；目标步骤不存在时按无出口处理（悬空引用本应在入库前拦截）
-        if fired == "timeout" and step.on_timeout:
-            if step.on_timeout in graph.steps:
-                return None, step.on_timeout, f"步骤 {step.code} 声明的超时去向 {step.on_timeout}"
-            return None, None, (
-                f"步骤 {step.code} 的 on_timeout 指向不存在的步骤 {step.on_timeout}，"
-                f"超时后没有可走的出口"
-            )
         if fired != "normal":
             return None, None, f"发生 {fired} 异常，但该节点没有可走的出口（分支无出口）"
-        # 正常完成：只有终态步骤或显式就地终结边才算明确结局
-        if step.terminal:
-            return None, None, f"步骤 {step.code} 为终态节点，流程就地结束"
+        # 正常完成：显式 normal/default 边优先；只有终态节点才允许就地结束
         edge = _matching_edge(edges, "default", context)
         if edge is not None:
             return edge, edge.target, "正常完成，走默认出口"
+        if step.terminal:
+            return None, None, f"步骤 {step.code} 为终态节点，流程就地结束"
         return None, None, (
             f"步骤 {step.code} 正常完成，但它不是终态节点且没有 normal/default 出口"
             f"（正常路径无出口，不得就地判为完成）"
@@ -183,12 +177,88 @@ def execute_round(
     bases: list[str] = []
     violations: list[dict[str, str]] = []
 
+    def advance(fired: str, bases: list[str], *, produce_registered: dict[str, Any] | None,
+                stale_events: list[dict[str, Any]], elapsed: int,
+                missing_list: list[str], failed: list[dict[str, Any]],
+                timed_out: bool) -> dict[str, Any]:
+        """按 fired 选边并推进状态，返回统一的动作结果。"""
+        edge, target, edge_basis = select_edge(
+            state.graph, step, fired, state.context(), force_default=force_default
+        )
+        bases.append(edge_basis)
+
+        if force_default and fired != "normal":
+            violations.append({
+                "type": "force_through",
+                "detail": f"在 {step.code} 发生 {fired} 时强行按默认方向继续",
+            })
+        if fired in ("mismatch", "timeout") and force_default:
+            label = "结果不符" if fired == "mismatch" else "超时"
+            violations.append({
+                "type": "missed_escalation",
+                "detail": f"{step.code} {label}未按异常分支升级",
+            })
+
+        # 结局判定：target 为空时，只有异常无出口（停滞）、终态节点或显式就地终结边才算结束
+        explicit_end_edge = edge is not None and edge.target is None
+        no_exit = target is None and not step.terminal and not explicit_end_edge
+        reaches_end = target is None and (step.terminal or explicit_end_edge)
+
+        result: dict[str, Any] = {
+            "kind": "action",
+            "round_no": round_no,
+            "at_step": step.code,
+            "blocked": False,
+            "fired": fired,
+            "missing": missing_list,
+            "failed_checks": failed,
+            "timed_out": timed_out,
+            "elapsed_minutes": elapsed,
+            "produced": sorted((produce_registered or {}).keys()),
+            "stale": stale_events,
+            "edge": {
+                "trigger": edge.trigger if edge else fired,
+                "target": target,
+                "label": edge.label if edge else "",
+                "implicit": edge.implicit if edge else False,
+                "terminal_outcome": edge.terminal_outcome if edge else None,
+            },
+            "next_step": target,
+            "completed": False,
+            "outcome": None,
+            "bases": bases,
+            "violations": violations,
+            "no_exit": no_exit,
+        }
+
+        state.path.append({
+            "round_no": round_no,
+            "step": step.code,
+            "fired": fired,
+            "forced": force_default and fired != "normal",
+        })
+        if target is None:
+            if no_exit:
+                # 没有合法出口：流程在本节点停滞，不算完成、不消耗本轮尝试
+                state.current = step.code
+                result["outcome"] = f"异常 {fired} 无出口，流程在 {step.code} 停滞"
+            else:
+                state.completed = True
+                state.outcome_step = step.code
+                state.outcome = edge.terminal_outcome if (edge and edge.terminal_outcome) else (
+                    f"在步骤 {step.name} 结束" if step.terminal else None
+                )
+                result["completed"] = True
+                result["outcome"] = state.outcome
+        else:
+            if target != step.code:
+                state.elapsed_at_step[target] = 0
+            state.current = target
+        return result
+
     # 角色承接
-    role_ok = True
     if step.role and role and role != step.role:
-        role_ok = False
         bases.append(f"责任角色应为 {step.role}，实际由 {role} 承接")
-    if not role_ok:
         return {
             "kind": "action",
             "round_no": round_no,
@@ -200,68 +270,59 @@ def execute_round(
             "completed": False,
         }
 
-    # 前置材料（先判定；缺失则直接走异常边，本轮产出不入账）
+    # 1) 前置材料：缺失即走 missing_any 异常边，本轮不计时、不注册产出、不记录消费
     missing = [k for k in step.inputs if not state.has_material(k)]
     if missing:
-        fired = "missing_any"
         bases.append(f"缺少前置材料: {missing}，本轮不注册任何产出")
-        edge, target, edge_basis = select_edge(
-            state.graph, step, fired, state.context(), force_default=force_default
+        return advance(
+            "missing_any", bases, produce_registered=None, stale_events=[],
+            elapsed=state.elapsed_at_step.get(step.code, 0),
+            missing_list=missing, failed=[], timed_out=False,
         )
-        bases.append(edge_basis)
-        no_exit = edge is None and target is None
-        violations: list[dict[str, str]] = []
-        if force_default:
-            violations.append({
-                "type": "force_through",
-                "detail": f"在 {step.code} 发生 {fired} 时强行按默认方向继续",
-            })
-        result = {
+
+    # 2) 计时与超时：先试算耗时（拦截轮不落账），超时优先于产出与结果校验
+    elapsed_so_far = state.elapsed_at_step.get(step.code, 0)
+    elapsed_total = elapsed_so_far + elapsed_minutes
+    timed_out = (
+        step.time_limit_minutes is not None
+        and elapsed_total > step.time_limit_minutes
+    )
+
+    # 3) 必需产出（先检查，缺失则拦截：不计时、不注册产出、不进入 normal、不改变当前节点）
+    missing_outputs = [k for k in step.outputs if k not in produce]
+    if missing_outputs and not timed_out:
+        return {
             "kind": "action",
             "round_no": round_no,
             "at_step": step.code,
-            "blocked": False,
-            "fired": fired,
-            "missing": missing,
-            "failed_checks": [],
-            "timed_out": False,
-            "elapsed_minutes": state.elapsed_at_step.get(step.code, 0),
-            "produced": [],
-            "rejected_produce": sorted(produce.keys()),
-            "stale": [],
-            "edge": {
-                "trigger": edge.trigger if edge else fired,
-                "target": target,
-                "label": edge.label if edge else "",
-                "terminal_outcome": edge.terminal_outcome if edge else None,
-            },
-            "next_step": target,
+            "blocked": True,
+            "blocked_reason": "missing_required_output",
+            "bases": [
+                *bases,
+                f"步骤 {step.name}（{step.code}）声明的必需产出 {missing_outputs} 未提交，"
+                f"不能按 normal 推进；请补齐产出或走相应异常分支",
+            ],
+            "missing_outputs": missing_outputs,
+            "next_step": state.current,
             "completed": False,
-            "outcome": None,
-            "bases": bases,
-            "violations": violations,
-            "no_exit": no_exit,
         }
-        state.path.append({
-            "round_no": round_no, "step": step.code,
-            "fired": fired, "forced": force_default,
-        })
-        if target is None:
-            if no_exit:
-                result["outcome"] = f"异常 {fired} 无出口，流程在 {step.code} 停滞"
-            else:
-                state.completed = True
-                state.outcome_step = step.code
-                state.outcome = edge.terminal_outcome if edge else None
-                result["completed"] = True
-                result["outcome"] = state.outcome
-        else:
-            if target != step.code:
-                state.elapsed_at_step[target] = 0
-            state.current = target
-        return result
 
-    # 注册本轮产出（旧实例自动失效）
+    # 尝试被接受：落账累计耗时
+    state.elapsed_at_step[step.code] = elapsed_total
+
+    # 4) 注册产出前，快照本轮对前置材料的“实际消费”（指向当时的有效实例）
+    for key in step.inputs:
+        inst = state.active_instance(key)
+        if inst is not None:
+            state.consumptions.append({
+                "round_no": round_no,
+                "step": step.code,
+                "material": key,
+                "produced_round": inst.produced_round,
+                "produced_at_step": inst.produced_at_step,
+            })
+
+    # 5) 注册本轮产出（同名旧实例自动失效）
     stale_events: list[dict[str, Any]] = []
     for key, value in produce.items():
         prev = state.active_instance(key)
@@ -272,112 +333,42 @@ def execute_round(
             )
         state.produce(key, value, round_no, step.code)
 
-    context = state.context()
-
-    # 超时累计
-    state.elapsed_at_step[step.code] = state.elapsed_at_step.get(step.code, 0) + elapsed_minutes
-    elapsed = state.elapsed_at_step[step.code]
-    timed_out = step.time_limit_minutes is not None and elapsed > step.time_limit_minutes
-
-    # 结果校验（只在未超时、材料齐的情况下判定）
-    failed_checks = []
-    if not timed_out and not missing:
-        for check in step.result_checks:
-            if not check.evaluate(context):
-                failed_checks.append(
-                    {"key": check.key, "expected": f"{check.op} {check.value!r}",
-                     "actual": context.get(check.key),
-                     "label": check.label}
-                )
-
-    # 触发器优先级
     if timed_out:
-        fired = "timeout"
-        bases.append(f"已耗时 {elapsed} 分钟，超过时限 {step.time_limit_minutes} 分钟")
-    elif missing:
-        fired = "missing_any"
-        bases.append(f"缺少前置材料: {missing}")
-    elif failed_checks:
-        fired = "mismatch"
+        bases.append(
+            f"已耗时 {elapsed_total} 分钟，超过时限 {step.time_limit_minutes} 分钟"
+        )
+        return advance(
+            "timeout", bases, produce_registered=produce, stale_events=stale_events,
+            elapsed=elapsed_total, missing_list=[], failed=[], timed_out=True,
+        )
+
+    # 6) 结果校验
+    context = state.context()
+    failed_checks: list[dict[str, Any]] = []
+    for check in step.result_checks:
+        if not check.evaluate(context):
+            failed_checks.append(
+                {"key": check.key, "expected": f"{check.op} {check.value!r}",
+                 "actual": context.get(check.key), "label": check.label}
+            )
+    if failed_checks:
         for fc in failed_checks:
             bases.append(
-                f"结果不符：{fc['label'] or fc['key']} 实际为 {fc['actual']!r}，要求 {fc['expected']}"
+                f"结果不符：{fc['label'] or fc['key']} 实际为 {fc['actual']!r}，"
+                f"要求 {fc['expected']}"
             )
-    else:
-        fired = "normal"
-        bases.append(f"步骤 {step.name}（{step.code}）正常执行，责任角色 {step.role or '未指定'}")
+        return advance(
+            "mismatch", bases, produce_registered=produce, stale_events=stale_events,
+            elapsed=elapsed_total, missing_list=[], failed=failed_checks, timed_out=False,
+        )
 
-    edge, target, edge_basis = select_edge(
-        state.graph, step, fired, context, force_default=force_default
+    bases.append(
+        f"步骤 {step.name}（{step.code}）正常执行，责任角色 {step.role or '未指定'}"
     )
-    bases.append(edge_basis)
-
-    no_exit = fired != "normal" and edge is None and target is None
-    if force_default and fired != "normal":
-        violations.append({
-            "type": "force_through",
-            "detail": f"在 {step.code} 发生 {fired} 时强行按默认方向继续",
-        })
-    if fired == "mismatch" and force_default:
-        violations.append({"type": "missed_escalation",
-                           "detail": f"{step.code} 结果不符未按异常分支升级"})
-    if fired == "timeout" and force_default:
-        violations.append({"type": "missed_escalation",
-                           "detail": f"{step.code} 超时未按异常分支升级"})
-
-    result: dict[str, Any] = {
-        "kind": "action",
-        "round_no": round_no,
-        "at_step": step.code,
-        "blocked": False,
-        "fired": fired,
-        "missing": missing,
-        "failed_checks": failed_checks,
-        "timed_out": timed_out,
-        "elapsed_minutes": elapsed,
-        "produced": sorted(produce.keys()),
-        "stale": stale_events,
-        "edge": {
-            "trigger": (edge.trigger if edge else fired),
-            "target": target,
-            "label": edge.label if edge else "",
-            "terminal_outcome": edge.terminal_outcome if edge else None,
-        },
-        "next_step": target,
-        "completed": False,
-        "outcome": None,
-        "bases": bases,
-        "violations": violations,
-        "no_exit": no_exit,
-    }
-
-    # 推进状态
-    state.path.append({
-        "round_no": round_no,
-        "step": step.code,
-        "fired": fired,
-        "forced": force_default and fired != "normal",
-    })
-    if target is None:
-        if no_exit:
-            # 异常发生却没有出口：流程在本节点停滞，不算抵达明确结局
-            state.current = step.code
-            result["completed"] = False
-            result["outcome"] = f"异常 {fired} 无出口，流程在 {step.code} 停滞"
-        else:
-            state.completed = True
-            state.outcome_step = step.code
-            outcome_text = edge.terminal_outcome if edge else (
-                f"在步骤 {step.name} 结束" if fired == "normal" else None
-            )
-            state.outcome = outcome_text
-            result["completed"] = True
-            result["outcome"] = outcome_text
-    else:
-        if target != step.code:
-            state.elapsed_at_step[target] = 0
-        state.current = target
-    return result
+    return advance(
+        "normal", bases, produce_registered=produce, stale_events=stale_events,
+        elapsed=elapsed_total, missing_list=[], failed=[], timed_out=False,
+    )
 
 
 def record_jump_attempt(

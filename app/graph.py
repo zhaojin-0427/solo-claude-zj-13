@@ -6,7 +6,10 @@
   cycle          循环依赖（无出口的强连通分量）
   no_role        无人承接（责任角色为空）
   no_exit        分支无出口（无论沿哪条边走都到不了明确结局）
-另有 dangling_ref（分支指向不存在的步骤）与 duplicate_step 两类引用问题。
+另有 dangling_ref（分支或 on_timeout 指向不存在的步骤）与 duplicate_step 两类引用问题。
+
+步骤自身的 on_timeout 声明被物化为一条隐式 timeout 边参与全部分析；
+若同节点已存在显式 timeout 分支，则以显式分支为准（on_timeout 仅兜底）。
 """
 from __future__ import annotations
 
@@ -14,6 +17,26 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from app.schemas import Branch, ProcessSpec, Step
+
+
+def materialize_edges(spec: ProcessSpec) -> list[Branch]:
+    """返回流程的全部边：显式分支 + on_timeout 隐式超时边。"""
+    edges = list(spec.branches)
+    explicit_timeout_sources = {
+        b.source for b in spec.branches if b.trigger == "timeout"
+    }
+    for step in spec.steps:
+        if step.on_timeout and step.code not in explicit_timeout_sources:
+            edges.append(
+                Branch(
+                    source=step.code,
+                    target=step.on_timeout,
+                    trigger="timeout",
+                    label=f"{step.code} 声明的 on_timeout 兜底",
+                    implicit=True,
+                )
+            )
+    return edges
 
 
 @dataclass
@@ -30,9 +53,9 @@ class Graph:
 
 
 def build_graph(spec: ProcessSpec) -> Graph:
-    """构建邻接表；不做语义校验（语义问题由 validate_graph 报告）。"""
+    """构建邻接表（含 on_timeout 隐式边）；不做语义校验（由 validate_graph 报告）。"""
     graph = Graph(spec=spec, steps=spec.step_map())
-    for branch in spec.branches:
+    for branch in materialize_edges(spec):
         graph.adjacency[branch.source].append(branch)
     # 声明顺序保持确定：同节点的边按 trigger、target 排序
     for edges in graph.adjacency.values():
@@ -62,16 +85,22 @@ def validate_graph(spec: ProcessSpec) -> list[GraphIssue]:
         issues.append(GraphIssue("duplicate_step", dupes, f"步骤编码重复: {dupes}"))
 
     steps = {c: s for c in code_set for s in spec.steps if s.code == c}
+    all_edges = materialize_edges(spec)
 
-    # 分支引用了不存在的源/目标
+    # 分支引用了不存在的源/目标（含 on_timeout 隐式边，节点指向发起该引用的步骤）
     dangling: dict[str, list[str]] = defaultdict(list)
-    for b in spec.branches:
+    for b in all_edges:
         if b.source not in code_set:
             dangling[b.source].append(f"源 {b.source} 不存在")
         if b.target is not None and b.target not in code_set:
-            dangling[b.target].append(
-                f"分支 {b.source} --{b.trigger}--> {b.target} 的目标不存在"
-            )
+            if b.implicit:
+                dangling[b.source].append(
+                    f"步骤 {b.source} 的 on_timeout 指向未定义步骤 {b.target}"
+                )
+            else:
+                dangling[b.target].append(
+                    f"分支 {b.source} --{b.trigger}--> {b.target} 的目标不存在"
+                )
     for node, details in sorted(dangling.items()):
         issues.append(GraphIssue("dangling_ref", [node], "；".join(details)))
 
@@ -84,11 +113,9 @@ def validate_graph(spec: ProcessSpec) -> list[GraphIssue]:
 
     # 3) 循环依赖：Tarjan 强连通分量，找出“没有任何边离开分量”的环
     adj: dict[str, set[str]] = defaultdict(set)
-    for b in spec.branches:
-        if b.source in code_set and b.target in code_set and b.target != b.source:
+    for b in all_edges:
+        if b.source in code_set and b.target in code_set:
             adj[b.source].add(b.target)
-        if b.source in code_set and b.target == b.source:
-            adj[b.source].add(b.source)
 
     index_counter = [0]
     stack: list[str] = []
@@ -142,7 +169,7 @@ def validate_graph(spec: ProcessSpec) -> list[GraphIssue]:
     # 邻接表（用于可达性，忽略悬空边）
     fwd: dict[str, set[str]] = defaultdict(set)
     has_explicit_end: set[str] = set()  # 有 target=None 就地终结边的节点
-    for b in spec.branches:
+    for b in all_edges:
         if b.source in code_set:
             if b.target is None:
                 has_explicit_end.add(b.source)

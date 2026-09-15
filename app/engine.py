@@ -127,16 +127,26 @@ def select_edge(
         edge = _matching_edge(edges, fired, context)
         if edge is not None:
             return edge, edge.target, f"命中分支触发器 {fired}"
-        # 超时可用步骤自身声明兜底
+        # 超时可用步骤自身声明兜底；目标步骤不存在时按无出口处理（悬空引用本应在入库前拦截）
         if fired == "timeout" and step.on_timeout:
-            return None, step.on_timeout, f"步骤 {step.code} 声明的超时去向 {step.on_timeout}"
+            if step.on_timeout in graph.steps:
+                return None, step.on_timeout, f"步骤 {step.code} 声明的超时去向 {step.on_timeout}"
+            return None, None, (
+                f"步骤 {step.code} 的 on_timeout 指向不存在的步骤 {step.on_timeout}，"
+                f"超时后没有可走的出口"
+            )
         if fired != "normal":
             return None, None, f"发生 {fired} 异常，但该节点没有可走的出口（分支无出口）"
-        # normal 无显式正常边：default 兜底
+        # 正常完成：只有终态步骤或显式就地终结边才算明确结局
+        if step.terminal:
+            return None, None, f"步骤 {step.code} 为终态节点，流程就地结束"
         edge = _matching_edge(edges, "default", context)
         if edge is not None:
             return edge, edge.target, "正常完成，走默认出口"
-        return None, None, "正常完成，本节点无后续边（就地结束）"
+        return None, None, (
+            f"步骤 {step.code} 正常完成，但它不是终态节点且没有 normal/default 出口"
+            f"（正常路径无出口，不得就地判为完成）"
+        )
 
     # 学生强行继续：按 normal -> default -> 第一条可用边 的顺序
     for trig in ("normal", "default"):
